@@ -1,66 +1,28 @@
 import pygame
 import numpy as np
-from numba import jit
-import math
-import colorsys
 from pygame.locals import *
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 
-@jit(nopython=True)
-def compute_fractal(width, height, max_iter, center_x, center_y, zoom, pixel_size, rotation):
-    result = np.zeros((height, width), dtype=np.float64)
-    orbit_x = np.zeros((height, width), dtype=np.float64)
-    orbit_y = np.zeros((height, width), dtype=np.float64)
-    edge_x = center_x
-    edge_y = center_y
-    max_diff = 0
+def compute_fractal_chunk(start_y, end_y, width, height, max_iter, center_x, center_y, zoom):
+    chunk_height = end_y - start_y
+    x = np.linspace(center_x - 2/zoom, center_x + 2/zoom, width)
+    y = np.linspace(center_y - 2/zoom * height/width + (4/zoom * height/width * start_y)/height, 
+                    center_y - 2/zoom * height/width + (4/zoom * height/width * end_y)/height, 
+                    chunk_height)
     
-    # Precompute rotation
-    cos_rot = math.cos(rotation)
-    sin_rot = math.sin(rotation)
+    c = x[None, :] + 1j * y[:, None]
+    z = np.zeros_like(c)
+    divtime = np.zeros_like(z, dtype=np.float32)
     
-    for y in range(height):
-        for x in range(width):
-            # Apply rotation to coordinates
-            dx = (x - width/2) * pixel_size / zoom
-            dy = (y - height/2) * pixel_size / zoom
-            real = center_x + (dx * cos_rot - dy * sin_rot)
-            imag = center_y + (dx * sin_rot + dy * cos_rot)
-            
-            c = real + imag * 1j
-            z = 0j
-            
-            # Track last orbit position for trails
-            last_x = 0
-            last_y = 0
-            
-            for i in range(max_iter):
-                z = z*z + c
-                if abs(z) > 2.0:
-                    # Smooth coloring formula
-                    log_zn = np.log(abs(z))
-                    nu = np.log(log_zn/np.log(2)) / np.log(2)
-                    result[y, x] = i + 1 - nu
-                    
-                    # Store last orbit position
-                    orbit_x[y, x] = last_x
-                    orbit_y[y, x] = last_y
-                    
-                    # Check if this is a more interesting edge point
-                    if x > 0 and abs(result[y, x] - result[y, x-1]) > max_diff:
-                        max_diff = abs(result[y, x] - result[y, x-1])
-                        edge_x = real
-                        edge_y = imag
-                    break
-                
-                # Store last position for orbit trails
-                last_x = z.real
-                last_y = z.imag
-            else:
-                result[y, x] = max_iter
-                orbit_x[y, x] = last_x
-                orbit_y[y, x] = last_y
+    for i in range(max_iter):
+        mask = np.abs(z) <= 2
+        if not np.any(mask):
+            break
+        z[mask] = z[mask]**2 + c[mask]
+        divtime[mask & (np.abs(z) > 2)] = i + 1 - np.log(np.log(np.abs(z[mask & (np.abs(z) > 2)]))) / np.log(2)
     
-    return result, edge_x, edge_y, orbit_x, orbit_y
+    return divtime
 
 class FractalRenderer:
     def __init__(self, width=800, height=600):
@@ -68,186 +30,179 @@ class FractalRenderer:
         self.width = width
         self.height = height
         self.screen = pygame.display.set_mode((width, height))
-        pygame.display.set_caption("Infinite Fractal Zoom")
+        pygame.display.set_caption("Fast Fractal Explorer")
         
         self.clock = pygame.time.Clock()
         self.start_time = pygame.time.get_ticks()
         
         # Fractal parameters
-        self.max_iter = 100
+        self.max_iter = 50  # Reduced max iterations
         self.zoom = 1.0
-        self.center_x = -0.7453
-        self.center_y = 0.1127
-        self.rotation = 0.0
-        self.rotation_speed = 0.001
+        self.center_x = -0.5
+        self.center_y = 0.0
+        self.zoom_speed = 1.1
         
-        # Smooth movement parameters
+        # Edge following
         self.target_x = self.center_x
         self.target_y = self.center_y
         self.velocity_x = 0
         self.velocity_y = 0
         self.edge_points = []
-        self.max_edge_points = 30
+        self.max_edge_points = 10
+        self.auto_navigate = True
         
-        # Trail effect
-        self.trail_surface = pygame.Surface((width, height))
-        self.trail_surface.set_alpha(128)
-        
-        # Dynamic color parameters
-        self.color_offset = 0
-        self.color_speed = 0.5
-        
-        # Improved dynamic resolution control
-        self.scale_factor = 4
+        # Performance optimization
+        self.scale_factor = 2
         self.min_scale_factor = 2
-        self.max_scale_factor = 8
-        self.target_fps = 30
+        self.max_scale_factor = 4
         self.fps_history = []
-        self.resolution_cooldown = 0
         
-        # Create enhanced color table
-        self.update_color_table()
+        # Threading
+        self.num_threads = max(1, multiprocessing.cpu_count() - 1)
+        self.thread_pool = ThreadPoolExecutor(max_workers=self.num_threads)
         
-        # Warm up JIT
-        _ = compute_fractal(10, 10, 50, 0, 0, 1.0, 4.0/10, 0.0)
-
-    def update_color_table(self):
+        # Pre-allocate surfaces
+        self.scaled_width = width // self.scale_factor
+        self.scaled_height = height // self.scale_factor
+        self.scaled_surface = pygame.Surface((self.scaled_width, self.scaled_height))
+        self.full_surface = pygame.Surface((width, height))
+        
+        # Create color table
         self.color_table = np.zeros((self.max_iter + 1, 3), dtype=np.uint8)
-        
-        # Create a psychedelic color palette
-        palette = [
-            (1.0, 0.0, 0.5),  # Hot pink
-            (0.0, 1.0, 1.0),  # Cyan
-            (1.0, 0.7, 0.0),  # Gold
-            (0.5, 0.0, 1.0),  # Purple
-            (0.0, 1.0, 0.5),  # Emerald
-            (1.0, 0.0, 0.5),  # Back to pink
+        self.update_color_table()
+    
+    def update_color_table(self):
+        palettes = [
+            # Electric
+            [(0,0,0), (32,0,255), (64,0,255), (255,128,0), (255,255,255)],
+            # Fire
+            [(0,0,0), (128,0,0), (255,64,0), (255,255,0), (255,255,255)],
+            # Ocean
+            [(0,0,32), (0,64,128), (0,128,255), (128,255,255), (255,255,255)]
         ]
+        
+        palette = palettes[0 % len(palettes)]
+        num_colors = len(palette)
         
         for i in range(self.max_iter + 1):
             if i < self.max_iter:
-                # Create smooth transitions between colors
-                phase = ((i % 64) / 64.0 + self.color_offset) % 1.0
-                palette_index = phase * (len(palette) - 1)
-                base_index = int(palette_index)
-                fract = palette_index - base_index
+                phase = ((i % 32) / 32.0 + 0) % 1.0
+                idx = phase * (num_colors - 1)
+                base_idx = int(idx)
+                fract = idx - base_idx
                 
-                # Interpolate between colors
-                r = palette[base_index][0] * (1 - fract) + palette[base_index + 1][0] * fract
-                g = palette[base_index][1] * (1 - fract) + palette[base_index + 1][1] * fract
-                b = palette[base_index][2] * (1 - fract) + palette[base_index + 1][2] * fract
-                
-                # Add wave effects
-                t = i * 0.1
-                wave = math.sin(phase * 6.28318 + self.color_offset * 10)
-                r = r * (0.7 + 0.3 * wave)
-                g = g * (0.7 + 0.3 * math.sin(wave + 2.09439))
-                b = b * (0.7 + 0.3 * math.sin(wave + 4.18879))
-                
-                # Ensure colors stay in valid range
-                r = max(0, min(1, r))
-                g = max(0, min(1, g))
-                b = max(0, min(1, b))
+                if base_idx < num_colors - 1:
+                    r = int(palette[base_idx][0] * (1 - fract) + palette[base_idx + 1][0] * fract)
+                    g = int(palette[base_idx][1] * (1 - fract) + palette[base_idx + 1][1] * fract)
+                    b = int(palette[base_idx][2] * (1 - fract) + palette[base_idx + 1][2] * fract)
+                else:
+                    r, g, b = palette[base_idx]
             else:
                 r, g, b = 0, 0, 0
             
-            self.color_table[i] = np.array([int(r * 255), int(g * 255), int(b * 255)])
-
-    def update(self):
-        current_time = (pygame.time.get_ticks() - self.start_time) / 1000.0
+            self.color_table[i] = np.array([r, g, b])
+    
+    def compute_fractal_parallel(self, w, h):
+        chunk_size = h // self.num_threads
+        futures = []
         
-        # Update rotation
-        self.rotation += self.rotation_speed
-        
-        # Update color cycling
-        self.color_offset += self.color_speed * 0.01
-        self.update_color_table()
-        
-        # Slower zoom for more stability
-        self.zoom = math.exp(current_time * 0.2)
-        
-        # More gradual iteration increase
-        new_max_iter = int(100 + math.log(self.zoom) * 15)
-        if new_max_iter > self.max_iter:
-            self.max_iter = new_max_iter
-            self.update_color_table()
-        
-        # Calculate dimensions
-        w = max(1, int(self.width / self.scale_factor))
-        h = max(1, int(self.height / self.scale_factor))
-        
-        # Compute fractal with rotation and get orbit data
-        iterations, edge_x, edge_y, orbit_x, orbit_y = compute_fractal(
-            w, h, self.max_iter, self.center_x, self.center_y,
-            self.zoom, 4.0/w, self.rotation
-        )
-        
-        # Add new edge point to history
-        self.edge_points.append((edge_x, edge_y))
-        if len(self.edge_points) > self.max_edge_points:
-            self.edge_points.pop(0)
-        
-        # Calculate average edge point
-        if self.edge_points:
-            avg_x = sum(x for x, _ in self.edge_points) / len(self.edge_points)
-            avg_y = sum(y for _, y in self.edge_points) / len(self.edge_points)
+        for i in range(self.num_threads):
+            start_y = i * chunk_size
+            end_y = start_y + chunk_size if i < self.num_threads - 1 else h
             
-            # Update target with smoothed edge point
-            self.target_x = avg_x
-            self.target_y = avg_y
+            future = self.thread_pool.submit(
+                compute_fractal_chunk,
+                start_y, end_y, w, h, self.max_iter,
+                self.center_x, self.center_y, self.zoom
+            )
+            futures.append(future)
         
-        # Apply momentum-based movement
-        dx = (self.target_x - self.center_x)
-        dy = (self.target_y - self.center_y)
+        iterations = np.zeros((h, w), dtype=np.float32)
         
-        # Update velocities with damping
-        self.velocity_x = self.velocity_x * 0.9 + dx * 0.02
-        self.velocity_y = self.velocity_y * 0.9 + dy * 0.02
+        for i, future in enumerate(futures):
+            chunk_result = future.result()
+            start_y = i * chunk_size
+            end_y = start_y + chunk_size if i < self.num_threads - 1 else h
+            iterations[start_y:end_y] = chunk_result
         
-        # Apply velocities to position
-        self.center_x += self.velocity_x
-        self.center_y += self.velocity_y
+        return iterations
+    
+    def find_interesting_points(self, iterations):
+        # Simplified gradient calculation
+        gradient_x = np.abs(np.diff(iterations[::2, ::2], axis=1))
+        gradient_y = np.abs(np.diff(iterations[::2, ::2], axis=0))
+        gradient_mag = gradient_x[:-1, :] + gradient_y[:, :-1]
         
-        # Get current FPS and update history
-        fps = self.clock.get_fps()
-        self.fps_history.append(fps)
-        if len(self.fps_history) > 10:  # Keep last 10 FPS readings
+        # Find top gradient points
+        flat_indices = np.argpartition(gradient_mag.ravel(), -5)[-5:]
+        y_coords, x_coords = np.unravel_index(flat_indices, gradient_mag.shape)
+        
+        # Convert to complex plane coordinates
+        x_complex = (x_coords * 2 - self.width/2) / (self.width/4) / self.zoom + self.center_x
+        y_complex = (y_coords * 2 - self.height/2) / (self.height/4) / self.zoom + self.center_y
+        
+        return list(zip(x_complex, y_complex))
+    
+    def update(self):
+        # Update parameters
+        if self.auto_navigate:
+            self.zoom *= self.zoom_speed
+        #self.color_offset += 0.01
+        
+        # Compute fractal at reduced resolution
+        w = self.scaled_width
+        h = self.scaled_height
+        
+        iterations = self.compute_fractal_parallel(w, h)
+        
+        # Edge following with reduced frequency
+        if self.auto_navigate and len(self.fps_history) % 2 == 0:
+            new_points = self.find_interesting_points(iterations)
+            if new_points:
+                self.edge_points.extend(new_points)
+                self.edge_points = self.edge_points[-self.max_edge_points:]
+                
+                weights = np.linspace(0.5, 1.0, len(self.edge_points))
+                self.target_x = np.average([x for x, _ in self.edge_points], weights=weights)
+                self.target_y = np.average([y for _, y in self.edge_points], weights=weights)
+                
+                dx = (self.target_x - self.center_x)
+                dy = (self.target_y - self.center_y)
+                
+                self.velocity_x = self.velocity_x * 0.9 + dx * 0.1
+                self.velocity_y = self.velocity_y * 0.9 + dy * 0.1
+                
+                self.center_x += self.velocity_x * 0.1
+                self.center_y += self.velocity_y * 0.1
+        
+        # Apply colors and scale
+        pixels = self.color_table[np.clip(iterations, 0, self.max_iter).astype(int)]
+        scaled_array = pygame.surfarray.pixels3d(self.scaled_surface)
+        scaled_array[:] = pixels.swapaxes(0, 1)
+        del scaled_array  # Release the surface lock
+        
+        if self.scale_factor > 1:
+            pygame.transform.scale(self.scaled_surface, (self.width, self.height), self.full_surface)
+            self.screen.blit(self.full_surface, (0, 0))
+        else:
+            self.screen.blit(self.scaled_surface, (0, 0))
+        
+        pygame.display.flip()
+        
+        # Performance monitoring
+        frame_time = self.clock.tick(60)
+        self.fps_history.append(frame_time)
+        if len(self.fps_history) > 10:
             self.fps_history.pop(0)
-        
-        # Calculate average FPS
-        avg_fps = sum(self.fps_history) / len(self.fps_history) if self.fps_history else fps
-        
-        # Update resolution with cooldown and smoothing
-        if self.resolution_cooldown > 0:
-            self.resolution_cooldown -= 1
-        elif avg_fps > 0:  # Avoid division by zero
-            if avg_fps > self.target_fps + 5 and self.scale_factor > self.min_scale_factor:
-                self.scale_factor = max(self.min_scale_factor, self.scale_factor - 0.5)
-                self.resolution_cooldown = 30  # Wait 30 frames before next change
-            elif avg_fps < self.target_fps - 5 and self.scale_factor < self.max_scale_factor:
-                self.scale_factor = min(self.max_scale_factor, self.scale_factor + 0.5)
-                self.resolution_cooldown = 30
-        
-        # Update window title with more info
-        pygame.display.set_caption(f"Fractal Zoom - FPS: {int(avg_fps)} - Scale: 1/{int(self.scale_factor)} - Zoom: {self.zoom:.1f}x")
-        
-        # Convert iterations to colors using clipped indices
-        iterations = np.clip(iterations, 0, self.max_iter).astype(np.int32)
-        pixels = self.color_table[iterations]
-        
-        # Create and scale surface
-        surf = pygame.surfarray.make_surface(pixels)
-        scaled = pygame.transform.scale(surf, (self.width, self.height))
-        
-        # Draw trail effect
-        self.trail_surface.blit(scaled, (0, 0))
-        self.screen.blit(self.trail_surface, (0, 0))
+            avg_frame_time = sum(self.fps_history) / len(self.fps_history)
+            
+            if avg_frame_time > 33:  # Below 30 FPS
+                self.scale_factor = min(self.scale_factor + 1, self.max_scale_factor)
+            elif avg_frame_time < 16 and self.scale_factor > self.min_scale_factor:  # Above 60 FPS
+                self.scale_factor = max(self.scale_factor - 1, self.min_scale_factor)
     
     def run(self):
         running = True
-        frames = 0
-        last_time = pygame.time.get_ticks()
-        
         while running:
             for event in pygame.event.get():
                 if event.type == QUIT:
@@ -255,19 +210,18 @@ class FractalRenderer:
                 elif event.type == KEYDOWN:
                     if event.key == K_ESCAPE:
                         running = False
+                    elif event.key == K_SPACE:
+                        self.update_color_table()
+                    elif event.key == K_UP:
+                        self.zoom_speed *= 1.1
+                    elif event.key == K_DOWN:
+                        self.zoom_speed /= 1.1
+                    elif event.key == K_TAB:
+                        self.auto_navigate = not self.auto_navigate
+                        if not self.auto_navigate:
+                            self.zoom_speed = 1.0
             
             self.update()
-            pygame.display.flip()
-            
-            # Update FPS counter every second
-            frames += 1
-            current_time = pygame.time.get_ticks()
-            if current_time - last_time > 1000:
-                fps = frames * 1000 / (current_time - last_time)
-                frames = 0
-                last_time = current_time
-            
-            self.clock.tick(60)
         
         pygame.quit()
 
