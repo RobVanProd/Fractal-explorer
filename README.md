@@ -1,47 +1,28 @@
-# Infinite Fractal Explorer
+# Fractal-explorer
 
-A dynamic Mandelbrot set explorer with infinite zoom, smooth color transitions, and interactive effects.
+Fractal-explorer is a Pygame/Numba Mandelbrot renderer that automatically zooms, tracks edge-heavy regions, and resets at a configured zoom threshold.
 
-## Features
+## What It Is
 
-- Infinite zoom capability with adaptive resolution
-- Dynamic edge detection and smooth tracking
-- Rotating view with trail effects
-- Psychedelic color cycling
-- Smooth performance optimization
-- Real-time FPS monitoring
+This repo contains a visual fractal explorer with two renderers: one NumPy-oriented file and one Pygame implementation. The Pygame renderer computes Mandelbrot iterations, maps colors, follows strong edges, adjusts zoom speed, and displays the animation in a window.
 
-## Requirements
+## Current Status
 
-- Python 3.8+
+Verified from code:
+
+- `fractal_renderer_pygame.py` uses Pygame and NumPy.
+- `compute_fractal_numba` is decorated for Numba acceleration.
+- The renderer tracks edge points and transitions when zoom exceeds `1e3`.
+
+`python -m pytest -q` reported `no tests ran` on 2026-05-28.
+
+## Tech Stack
+
+- Python
 - Pygame
 - NumPy
 - Numba
 
-## Installation
+## Limitations
 
-1. Clone the repository:
-```bash
-git clone https://github.com/robvanprod/fractal-explorer.git
-cd fractal-explorer
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-## Usage
-
-Run the fractal explorer:
-```bash
-python fractal_renderer_pygame.py
-```
-
-Controls:
-- ESC: Exit the application
-- The fractal automatically zooms and follows interesting patterns
-
-## Performance
-
-The renderer automatically adjusts quality based on your system's performance to maintain smooth animation. The current FPS and scale factor are displayed in the window title.
+This is a graphics experiment with no automated tests. Performance and stability depend on local graphics/runtime behavior and should be described only after running the app on the target machine.
